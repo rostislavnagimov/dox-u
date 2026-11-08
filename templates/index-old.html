@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+
+  <head>
+    <script src="/script.js" defer></script>
+    <meta charset="utf-8">
+    <style>
+      * {
+        margin: 0;
+        font-size: 15px !important;
+      }
+      body {
+        background: #aae;
+        padding: 30px;
+
+      }
+      iframe {
+        width: 100%;
+        height: 10vh;
+      }
+      article {
+        background: radial-gradient(circle at 0 0, #fff9 10%, #aae5);
+        padding: 10px;
+        border-radius: 10px;
+        border: 2px solid #fff;
+        margin-bottom: 20px;
+        max-width: 100vw;
+        overflow: scroll;
+      }
+    </style>
+  </head>
+  <body>
+    <article>
+      <h2>Server</h2>
+        <table>
+          <tr>
+            <td>Country</td>
+            <td>{{ country }}</td>
+          </tr>
+        </table>
+
+    </article>
+
+
+
+<article>
+<h2>Client</h2>
+
+<div id="client"></div>
+</article>
+<article>
+<h2>Old</h2>
+
+    <h1>{{ method }} {{ uri }} {{ version }}</h1>
+
+<table border="1">
+{% for (name, value) in headers %}
+  <tr><td>{{ name }}</td><td>{{ value }}</td></tr>
+{% endfor %}
+</table>
+</article>
+
+
+  </body>
+</html>

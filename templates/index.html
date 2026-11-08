@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+  <head>
+    <script src="/script.js" defer></script>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+      * {
+        margin: 0;
+        font-size: 15px;
+      }
+      body {
+        background: #aae;
+        padding: 30px;
+
+      }
+      iframe {
+        width: 100%;
+        height: 10vh;
+      }
+      article {
+        background: radial-gradient(circle at 0 0, #fff9 10%, #aae5);
+        padding: 10px;
+        border-radius: 20px;
+        border: 2px solid #fff;
+        margin-bottom: 20px;
+        max-width: 100vw;
+        overflow: scroll;
+      }
+    </style>
+  </head>
+  <body>
+    <article>
+      <ul>
+        <li><span>Platform</span> <span>{{ platform }}</span></li>
+        <li><span>IP</span> <span>{{ ip }}</span></li>
+        <li><span>Country</span> <span>{{ country }}</span></li>
+        <li><span>Browser</span> <span>{{ browser }}</span></li>
+        <li><span>Lang</span> <span>{{ lang }}</span></li>
+        <li><span>Mobile</span> <span>{{ mobile }}</span></li>
+        <li><span>Region</span> <span>{{ region }}</span></li>
+        <li><span>City</span> <span>{{ city }}</span></li>
+        <li><span>Timezone</span> <span>{{ timezone }}</span></li>
+        <li><span>Timeshift to UTC</span> <span>{{ timeshift }}</span></li>
+      </ul>
+      
+      
+  
+      
+    </article>
+  </body>
+</html>
