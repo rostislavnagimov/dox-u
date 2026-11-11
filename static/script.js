@@ -1,3 +1,4 @@
+const doxScriptUrl = document.currentScript?.src || location.href;
 
 async function collect() {
   const intl = Intl.DateTimeFormat().resolvedOptions();
@@ -390,10 +391,69 @@ const entityContent = document.getElementById('entity-content');
 const rawServer = document.getElementById('raw-server');
 const rawClient = document.getElementById('raw-client');
 const rawIp = document.getElementById('raw-ip');
-const serverData = JSON.parse(rawServer.textContent);
-const initialIpData = JSON.parse(rawIp.textContent);
+const bootData = window.__DOX_BOOT__ || {};
+const serverData = bootData.server || (rawServer ? JSON.parse(rawServer.textContent) : {});
+if (rawServer && bootData.server) rawServer.textContent = JSON.stringify(bootData.server, null, 2);
+if (rawIp && bootData.ipResponse) rawIp.textContent = JSON.stringify(bootData.ipResponse, null, 2);
 
-overviewTab.addEventListener('click', () => {
+function isPublicIp(value) {
+  if (typeof value !== 'string') return false;
+  const ip = value.toLowerCase().split('%')[0];
+  if (ip.includes(':')) {
+    const mappedV4 = ip.match(/(?:^|:)ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+    if (mappedV4) return isPublicIp(mappedV4[1]);
+    const firstGroup = Number.parseInt(ip.split(':').filter(Boolean)[0] || '0', 16);
+    return firstGroup >= 0x2000 && firstGroup <= 0x3fff && !ip.startsWith('2001:db8:');
+  }
+
+  const octets = ip.split('.').map(Number);
+  if (octets.length !== 4 || octets.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  const [a, b, c] = octets;
+  return a !== 0 && a !== 10 && a !== 127 && a < 224
+    && !(a === 100 && b >= 64 && b <= 127)
+    && !(a === 169 && b === 254)
+    && !(a === 172 && b >= 16 && b <= 31)
+    && !(a === 192 && b === 168)
+    && !(a === 192 && b === 0 && c === 0)
+    && !(a === 192 && b === 0 && c === 2)
+    && !(a === 198 && (b === 18 || b === 19))
+    && !(a === 198 && b === 51 && c === 100)
+    && !(a === 203 && b === 0 && c === 113);
+}
+
+async function lookupIp(ip) {
+  if (!isPublicIp(ip)) return null;
+  try {
+    const response = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}?fields=success,country,region,city,timezone`, {
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+async function lookupIpLocations(d) {
+  const webrtcIps = [...new Set((d.extra?.webrtc?.ips || []).filter(ip => typeof ip === 'string'))].slice(0, 8);
+  const ipValues = [...new Set([serverData.ip, serverData.peerIp, ...webrtcIps].filter(ip => typeof ip === 'string'))];
+  const responses = new Map(await Promise.all(ipValues.map(async ip => [ip, await lookupIp(ip)])));
+  const entry = ip => ip ? {
+    ip,
+    public: isPublicIp(ip),
+    matchesServer: ip === serverData.ip,
+    matchesPeer: ip === serverData.peerIp,
+    response: responses.get(ip) || null,
+  } : null;
+
+  return {
+    server: entry(serverData.ip),
+    peer: entry(serverData.peerIp),
+    webrtc: webrtcIps.map(entry),
+  };
+}
+
+if (overviewTab && rawToggle) overviewTab.addEventListener('click', () => {
   rawToggle.checked = false;
 });
 
@@ -405,6 +465,32 @@ function displayValue(value) {
   return String(value);
 }
 
+function isKnown(value) {
+  return value !== undefined && value !== null && value !== '' && value !== 'Unknown'
+    && !(Array.isArray(value) && value.length === 0);
+}
+
+function comparableValue(value) {
+  const values = Array.isArray(value) ? value : String(value).split(',');
+  return values
+    .map(item => String(item).trim().toLowerCase().replace(/^google chrome\b/, 'chrome'))
+    .filter(Boolean)
+    .sort()
+    .join('|');
+}
+
+function factRow(label, server, browser) {
+  const hasServer = isKnown(server);
+  const hasBrowser = isKnown(browser);
+  if (hasServer && hasBrowser) {
+    if (comparableValue(server) === comparableValue(browser)) return {label, value: server};
+    return {label, server, client: browser, status: {text: 'Different', kind: 'diff'}};
+  }
+  if (hasServer) return {label, value: server};
+  if (hasBrowser) return {label, value: browser};
+  return null;
+}
+
 function addBadge(parent, text, kind = 'unknown') {
   const badge = document.createElement('span');
   badge.className = `badge ${kind}`;
@@ -413,7 +499,7 @@ function addBadge(parent, text, kind = 'unknown') {
 }
 
 function addRow(list, rowData) {
-  const {label, value, server, client, status, detail} = rowData;
+  const {label, value, server, client, status} = rowData;
   const row = document.createElement('div');
   row.className = 'entity-row';
 
@@ -428,7 +514,7 @@ function addRow(list, rowData) {
   if (Object.hasOwn(rowData, 'server') || Object.hasOwn(rowData, 'client')) {
     const pair = document.createElement('div');
     pair.className = 'pair-values';
-    for (const [source, item] of [['Server', server], ['Client', client]]) {
+    for (const [source, item] of [['Server', server], ['Browser', client]]) {
       const cell = document.createElement('div');
       cell.className = 'pair-cell';
       const sourceLabel = document.createElement('span');
@@ -449,19 +535,13 @@ function addRow(list, rowData) {
   }
 
   if (status) addBadge(content, status.text, status.kind);
-  if (detail) {
-    const note = document.createElement('div');
-    note.className = 'notice';
-    note.textContent = detail;
-    content.append(note);
-  }
   row.append(content);
   list.append(row);
 }
 
-function addCard(container, title, rows, {wide = false, subtitle = '', icon = '•'} = {}) {
+function addCard(container, title, rows, {icon = '•'} = {}) {
   const card = document.createElement('article');
-  card.className = `entity-card${wide ? ' wide' : ''}`;
+  card.className = 'entity-card';
   const head = document.createElement('div');
   head.className = 'card-head';
   const heading = document.createElement('div');
@@ -469,15 +549,20 @@ function addCard(container, title, rows, {wide = false, subtitle = '', icon = '�
   titleNode.className = 'card-title';
   titleNode.textContent = title;
   heading.append(titleNode);
-  if (subtitle) {
-    const subtitleNode = document.createElement('p');
-    subtitleNode.className = 'card-subtitle';
-    subtitleNode.textContent = subtitle;
-    heading.append(subtitleNode);
-  }
   const iconNode = document.createElement('span');
   iconNode.className = 'card-icon';
-  iconNode.textContent = icon;
+  if (icon.startsWith('/icons/')) {
+    const assetName = icon.slice('/icons/'.length);
+    const svg = bootData.icons?.[assetName];
+    if (svg) {
+      iconNode.innerHTML = svg;
+      iconNode.querySelector('svg')?.setAttribute('aria-hidden', 'true');
+    } else {
+      iconNode.textContent = '•';
+    }
+  } else {
+    iconNode.textContent = icon;
+  }
   head.append(heading, iconNode);
   card.append(head);
 
@@ -487,32 +572,6 @@ function addCard(container, title, rows, {wide = false, subtitle = '', icon = '�
   card.append(list);
   container.append(card);
   return card;
-}
-
-function addSectionHeading(container, title, description) {
-  const section = document.createElement('div');
-  section.className = 'section-heading';
-  const text = document.createElement('div');
-  const heading = document.createElement('h2');
-  heading.textContent = title;
-  const subtitle = document.createElement('p');
-  subtitle.textContent = description;
-  text.append(heading, subtitle);
-  section.append(text);
-  container.append(section);
-}
-
-function formatBytes(value) {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return 'Not available';
-  if (value < 1024) return `${Math.round(value)} B`;
-  const units = ['KB', 'MB', 'GB', 'TB'];
-  let size = value / 1024;
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  return `${size.toFixed(1)} ${units[unit]}`;
 }
 
 function formatOffset(seconds) {
@@ -547,13 +606,26 @@ function getClientDeviceType(d) {
   return /Mobi|iPhone|iPad|Android/i.test(d.ua) ? 'Mobile' : 'Desktop';
 }
 
-function timezoneComparison(d) {
-  if (!serverData.timezone || !d.tz || typeof d.tzOffsetMin !== 'number' || typeof serverData.timezoneOffsetSeconds !== 'number') {
+function getClientPlatform(d) {
+  if (d.uaData?.platform) return d.uaData.platform;
+  if (/iPhone|iPad|iPod/i.test(d.ua || '')) return 'iOS';
+  if (/Android/i.test(d.ua || '')) return 'Android';
+  if (/Windows/i.test(d.ua || '')) return 'Windows';
+  if (/Macintosh|Mac OS X/i.test(d.ua || '')) return 'macOS';
+  if (/CrOS/i.test(d.ua || '')) return 'ChromeOS';
+  if (/Linux/i.test(d.ua || '')) return 'Linux';
+  return d.platform;
+}
+
+function timezoneComparison(d, serverGeo) {
+  const serverTimezone = serverGeo?.timezone?.id;
+  const serverOffset = serverGeo?.timezone?.offset;
+  if (!serverTimezone || !d.tz || typeof d.tzOffsetMin !== 'number' || typeof serverOffset !== 'number') {
     return {text: 'Not enough data', kind: 'unknown'};
   }
   const clientOffsetSeconds = -d.tzOffsetMin * 60;
-  const sameZone = serverData.timezone === d.tz;
-  const sameOffset = Math.abs(serverData.timezoneOffsetSeconds - clientOffsetSeconds) < 60;
+  const sameZone = serverTimezone === d.tz;
+  const sameOffset = Math.abs(serverOffset - clientOffsetSeconds) < 60;
   return sameZone && sameOffset
     ? {text: 'Matches', kind: 'match'}
     : {text: 'Different', kind: 'diff'};
@@ -570,232 +642,185 @@ function ipComparison(ips, lookups) {
     : {text: 'Matches server IP', kind: 'match'};
 }
 
-function renderOverview(d, ipLookups = [], ipLookupError = null) {
+function renderOverview(d, ipLookups = {server: null, peer: null, webrtc: []}, ipLookupError = null) {
   entityContent.replaceChildren();
-  addSectionHeading(entityContent, 'Identity & location', 'The same entities compared across server and browser signals.');
   const grid = document.createElement('div');
   grid.className = 'entity-grid';
   entityContent.append(grid);
 
   const clientProfile = {
-    platform: d.uaData?.platform || d.platform,
+    platform: getClientPlatform(d),
     platformVersion: d.uaData?.platformVersion,
     deviceModel: d.uaData?.model,
     architecture: d.uaData?.architecture,
     bitness: d.uaData?.bitness,
   };
-  addCard(grid, 'Device & browser', [
-    {label: 'Platform', server: serverData.platform, client: clientProfile.platform},
-    {label: 'Platform version', server: serverData.platformVersion, client: clientProfile.platformVersion},
-    {label: 'Device type', server: serverData.deviceType, client: getClientDeviceType(d)},
-    {label: 'Device model', server: serverData.deviceModel, client: clientProfile.deviceModel},
-    {label: 'Architecture', server: serverData.architecture, client: clientProfile.architecture},
-    {label: 'Bitness', server: serverData.bitness, client: clientProfile.bitness},
-    {label: 'Browser', server: serverData.browser, client: getClientBrowser(d)},
-    {label: 'Languages', server: serverData.languages, client: d.languages},
-  ], {wide: true, subtitle: 'Server received / Browser reports', icon: 'D'});
+  const platformName = clientProfile.platform || serverData.platform;
+  const platformKey = String(platformName || '').toLowerCase();
+  const platformIcon = /android/.test(platformKey)
+    ? '/icons/android.svg'
+    : /windows/.test(platformKey)
+      ? '/icons/windows.svg'
+      : /ios|iphone|ipad|mac/.test(platformKey)
+        ? '/icons/apple.svg'
+        : '/icons/device.svg';
+  const deviceRows = [
+    factRow('Platform', serverData.platform, clientProfile.platform),
+    factRow('OS version', serverData.platformVersion, clientProfile.platformVersion),
+    factRow('Device type', serverData.deviceType, getClientDeviceType(d)),
+    factRow('Model', serverData.deviceModel, clientProfile.deviceModel),
+    factRow('Architecture', serverData.architecture, clientProfile.architecture),
+    factRow('Bitness', serverData.bitness, clientProfile.bitness),
+  ].filter(Boolean);
+  if (deviceRows.length) addCard(grid, 'Device', deviceRows, {icon: platformIcon});
 
-  addCard(grid, 'Timezone', [
-    {label: 'Timezone', server: serverData.timezone, client: d.tz},
-    {label: 'UTC offset', server: serverData.timezone ? formatOffset(serverData.timezoneOffsetSeconds) : null, client: formatOffset(-d.tzOffsetMin * 60)},
-    {label: 'Comparison', status: timezoneComparison(d)},
-    {label: 'Locale', client: d.locale},
-    {label: 'Captured at', client: d.time ? new Date(d.time).toLocaleString() : null},
-  ], {subtitle: 'IP-based timezone compared with the browser timezone', icon: '◷'});
-
-  const serverPlace = [serverData.city, serverData.region, serverData.country].filter(value => value && value !== 'Unknown').join(', ') || 'Not available';
-  addCard(grid, 'Server IP & location', [
-    {label: 'Server-visible IP', value: serverData.ip},
-    {label: 'Geolocation', value: serverPlace},
-    {label: 'Timezone', value: serverData.timezone},
-  ], {subtitle: 'Location estimated for the IP seen by the server', icon: '⌖'});
-
-  const webrtcIps = d.extra?.webrtc?.ips || [];
-  const ipStatus = ipComparison(webrtcIps, ipLookups);
-  addCard(grid, 'WebRTC IP addresses', [
-    {label: 'Comparison', status: ipStatus},
-    {label: 'Server IP', value: serverData.ip},
-    {label: 'WebRTC supported', value: d.extra?.webrtc?.supported},
-    {label: 'WebRTC candidates', value: webrtcIps},
-  ], {subtitle: 'Public candidates are compared with the server-visible IP', icon: '⇄'});
-
-  addSectionHeading(entityContent, 'Browser & device signals', 'Values available from browser APIs in this session.');
-  const signals = document.createElement('div');
-  signals.className = 'entity-grid';
-  entityContent.append(signals);
+  const browserRows = [
+    factRow('Browser', serverData.browser, getClientBrowser(d)),
+  ].filter(Boolean);
+  if (browserRows.length) addCard(grid, 'Browser', browserRows, {icon: '/icons/browser.svg'});
 
   const screen = d.screen || {};
   const viewport = d.viewport || {};
-  addCard(signals, 'Display', [
-    {label: 'Screen', value: `${screen.w ?? '—'} × ${screen.h ?? '—'} px`},
-    {label: 'Available area', value: `${screen.availW ?? '—'} × ${screen.availH ?? '—'} px`},
-    {label: 'Viewport', value: `${viewport.w ?? '—'} × ${viewport.h ?? '—'} px`},
-    {label: 'Color depth', value: screen.colorDepth ? `${screen.colorDepth} bit` : null},
-    {label: 'Pixel ratio', value: screen.dpr},
-  ], {icon: '▣'});
+  const devices = d.extra?.devices || {};
+  const hardwareRows = [];
+  if (screen.w && screen.h) hardwareRows.push({label: 'Screen', value: `${screen.w} × ${screen.h} px`});
+  if (viewport.w && viewport.h && (viewport.w !== screen.w || viewport.h !== screen.h)) {
+    hardwareRows.push({label: 'Viewport', value: `${viewport.w} × ${viewport.h} px`});
+  }
+  if (screen.dpr) hardwareRows.push({label: 'Pixel ratio', value: `${screen.dpr}×`});
+  if (screen.colorDepth) hardwareRows.push({label: 'Color depth', value: `${screen.colorDepth} bit`});
+  if (typeof d.cores === 'number') hardwareRows.push({label: 'CPU cores', value: d.cores});
+  if (typeof d.memoryGB === 'number') hardwareRows.push({label: 'Memory estimate', value: `${d.memoryGB} GB`});
+  if (typeof d.touchPoints === 'number') hardwareRows.push({label: 'Touch points', value: d.touchPoints});
+  if (typeof devices.total === 'number') hardwareRows.push({label: 'Media devices', value: devices.total});
+  if (hardwareRows.length) addCard(grid, 'Hardware & display', hardwareRows, {icon: '/icons/hardware.svg'});
 
-  addCard(signals, 'Hardware', [
-    {label: 'CPU cores', value: d.cores},
-    {label: 'Memory estimate', value: typeof d.memoryGB === 'number' ? `${d.memoryGB} GB` : null},
-    {label: 'Touch points', value: d.touchPoints},
-    {label: 'WOW64', value: d.uaData?.wow64},
-    {label: 'Media devices', value: d.extra?.devices?.total},
-    {label: 'Audio inputs', value: d.extra?.devices?.audioInputs},
-    {label: 'Audio outputs', value: d.extra?.devices?.audioOutputs},
-    {label: 'Video inputs', value: d.extra?.devices?.videoInputs},
-  ], {subtitle: 'Browser-reported values; some may be rounded or restricted', icon: '⌘'});
-
+  const uniqueWebrtcIps = [...new Set((d.extra?.webrtc?.ips || []).filter(ip => typeof ip === 'string'))];
+  const differentWebrtcIps = (ipLookups.webrtc || [])
+    .filter(result => result.public && !result.matchesServer)
+    .map(result => result.ip);
+  const peerStatus = serverData.ipSource === 'connection'
+    ? {text: 'No forwarded IP; using peer', kind: 'unknown'}
+    : serverData.ipMatchesPeer
+      ? {text: 'Same IP', kind: 'match'}
+      : {text: 'Different IP', kind: 'diff'};
+  const networkRows = [
+    {label: serverData.ip === serverData.peerIp ? 'IP address' : 'IP seen by app', value: serverData.ip},
+    ...(serverData.ip === serverData.peerIp ? [] : [{label: 'Connection peer', value: serverData.peerIp}]),
+    {label: 'Forwarded IP check', status: peerStatus},
+    {label: 'WebRTC check', status: ipComparison(uniqueWebrtcIps, ipLookups.webrtc || [])},
+  ];
+  if (differentWebrtcIps.length) networkRows.push({label: 'Other WebRTC IPs', value: differentWebrtcIps});
   const network = d.network || {};
-  addCard(signals, 'Network', [
-    {label: 'Online', value: d.online},
-    {label: 'Effective type', value: network.type},
-    {label: 'Downlink estimate', value: typeof network.downlink === 'number' ? `${network.downlink} Mbps` : null},
-    {label: 'Round-trip time', value: typeof network.rtt === 'number' ? `${network.rtt} ms` : null},
-    {label: 'Data saver', value: network.saveData},
-  ], {icon: '⌁'});
+  if (typeof d.online === 'boolean') networkRows.push({label: 'Internet', value: d.online ? 'Online' : 'Offline'});
+  if (network.type) networkRows.push({label: 'Connection type', value: network.type});
+  if (typeof network.rtt === 'number') networkRows.push({label: 'Round-trip time', value: `${network.rtt} ms`});
+  if (typeof network.downlink === 'number') networkRows.push({label: 'Downlink estimate', value: `${network.downlink} Mbps`});
+  addCard(grid, 'Network & IP', networkRows, {icon: '/icons/network.svg'});
 
-  addCard(signals, 'Privacy & preferences', [
-    {label: 'Cookies enabled', value: d.cookiesEnabled},
-    {label: 'Do Not Track', value: d.dnt},
-    {label: 'Global Privacy Control', value: d.gpc},
-    {label: 'Dark mode', value: d.darkMode},
-    {label: 'Reduced motion', value: d.reducedMotion},
-  ], {icon: '◈'});
-
-  const gpu = d.extra?.gpu || {};
-  addCard(signals, 'Graphics', [
-    {label: 'GPU vendor', value: gpu.vendor},
-    {label: 'Renderer', value: gpu.renderer},
-    {label: 'WebGL version', value: gpu.version},
-    {label: 'Shader language', value: gpu.shadingLanguage},
-  ], {icon: '◩'});
-
-  const storage = d.extra?.storage || {};
-  addCard(signals, 'Storage', [
-    {label: 'Usage', value: formatBytes(storage.usage)},
-    {label: 'Quota', value: formatBytes(storage.quota)},
-    {label: 'Available', value: formatBytes(storage.available)},
-  ], {icon: '▤'});
-
-  const media = d.extra?.media || {};
-  const codecs = [
-    ['H.264 / MP4', 'video/mp4; codecs="avc1.42E01E"'],
-    ['VP9 / WebM', 'video/webm; codecs="vp9"'],
-    ['VP8 / WebM', 'video/webm; codecs="vp8"'],
-    ['AAC / MP4', 'audio/mp4; codecs="mp4a.40.2"'],
-    ['Opus / Ogg', 'audio/ogg; codecs="opus"'],
-  ];
-  addCard(signals, 'Media formats', codecs.map(([label, key]) => ({label, value: media[key]})), {icon: '▷'});
-
-  const permissions = d.extra?.permissions || {};
-  const permissionRows = Object.entries(permissions).map(([name, state]) => ({label: name, value: state}));
-  addCard(signals, 'Permissions', permissionRows.length ? permissionRows : [{label: 'Permission API', value: 'Not available'}], {subtitle: 'States are read without requesting access', icon: '✓'});
-
-  const capabilities = d.extra?.capabilities || {};
-  const capabilityRows = [];
-  const capabilityLabels = {
-    webgl: 'WebGL', webgl2: 'WebGL 2', webgpu: 'WebGPU', bluetooth: 'Bluetooth', usb: 'USB',
-    serial: 'Serial', hid: 'HID', midi: 'MIDI', serviceWorker: 'Service worker',
-    sharedArrayBuffer: 'SharedArrayBuffer', mediaDevices: 'Media devices',
-    broadcastChannel: 'BroadcastChannel', indexedDB: 'IndexedDB', localStorage: 'Local storage',
+  const serverGeo = ipLookups.server?.response;
+  const peerGeo = ipLookups.peer?.response;
+  const placeFor = response => response?.success === true
+    ? [response.city, response.region, response.country].filter(Boolean).join(', ')
+    : '';
+  const placeLabels = new Map();
+  const addPlace = (label, ip, response) => {
+    if (!ip || !response?.success) return;
+    const place = placeFor(response);
+    if (!place) return;
+    const labels = placeLabels.get(place) || [];
+    labels.push(label);
+    placeLabels.set(place, labels);
   };
-  for (const [key, label] of Object.entries(capabilityLabels)) capabilityRows.push({label, value: capabilities[key]});
-  for (const group of ['pointer', 'hover', 'display']) {
-    for (const [key, value] of Object.entries(capabilities[group] || {})) {
-      const label = `${group[0].toUpperCase()}${group.slice(1)} · ${key}`;
-      capabilityRows.push({label, value});
-    }
+  addPlace(serverData.ip === serverData.peerIp ? 'IP' : 'App IP', serverData.ip, serverGeo);
+  if (serverData.peerIp !== serverData.ip) addPlace('Peer', serverData.peerIp, peerGeo);
+  for (const result of ipLookups.webrtc || []) {
+    if (result.ip !== serverData.ip && result.ip !== serverData.peerIp) addPlace('WebRTC', result.ip, result.response);
   }
-  addCard(signals, 'Browser capabilities', capabilityRows, {wide: true, icon: '⌬'});
+  const locationRows = [...placeLabels].map(([place, labels]) => ({
+    label: [...new Set(labels)].join(' + '),
+    value: place,
+  }));
+  if (!locationRows.length) locationRows.push({label: 'IP location', value: 'Not available'});
+  addCard(grid, 'Location', locationRows, {icon: '/icons/location.svg'});
 
-  const wallets = d.extra?.wallets || {};
-  const walletRows = [
-    {label: 'EVM wallets', value: wallets.evm?.length ? wallets.evm.map(wallet => wallet.name) : 'None detected'},
-    {label: 'Solana wallets', value: wallets.solana?.length ? wallets.solana.map(wallet => wallet.name) : 'None detected'},
-  ];
-  addCard(signals, 'Wallets', walletRows, {icon: '◇'});
-
-  addSectionHeading(entityContent, 'WebRTC geolocation', 'Each public candidate is located separately and compared with the server IP.');
-  const geoGrid = document.createElement('div');
-  geoGrid.className = 'entity-grid';
-  entityContent.append(geoGrid);
-  const geoCard = addCard(geoGrid, 'WebRTC IP locations', [], {wide: true, icon: '⌖'});
-  const geoList = document.createElement('div');
-  geoList.className = 'geo-list';
-  const geoResults = ipLookups;
-  if (!geoResults.length) {
-    const empty = document.createElement('div');
-    empty.className = 'notice';
-    empty.textContent = ipLookupError
-      ? 'WebRTC IP geolocation could not be loaded.'
-      : webrtcIps.length
-        ? 'No public WebRTC IP was available for geolocation.'
-        : d.extra?.webrtc?.supported
-          ? 'No WebRTC IP candidate was detected.'
-          : 'WebRTC is not supported by this browser.';
-    geoList.append(empty);
-  }
-  for (const result of geoResults) {
-    const item = document.createElement('div');
-    item.className = 'geo-item';
-    const itemHead = document.createElement('div');
-    itemHead.className = 'geo-item-head';
-    const ip = document.createElement('span');
-    ip.className = 'geo-ip';
-    ip.textContent = result.ip;
-    const canCompare = serverData.ip && serverData.ip !== 'Unknown';
-    const isSame = result.matchesServer;
-    const badge = document.createElement('span');
-    badge.className = `badge ${!canCompare ? 'unknown' : isSame ? 'match' : 'diff'}`;
-    badge.textContent = !canCompare ? 'Cannot compare' : isSame ? 'Same as server' : 'Different from server';
-    itemHead.append(ip, badge);
-    item.append(itemHead);
-    const response = result.response;
-    const place = document.createElement('div');
-    place.className = 'geo-place';
-    if (response?.success === true) {
-      place.textContent = [response.city, response.region, response.country, response.timezone?.id].filter(Boolean).join(' · ') || 'Location not available';
-    } else {
-      place.textContent = result.public ? 'Location not available' : 'Local or non-public address; no location lookup';
+  const serverTimezone = serverGeo?.timezone?.id;
+  const serverOffset = serverGeo?.timezone?.offset;
+  const zoneCheck = timezoneComparison(d, serverGeo);
+  let timezoneRows;
+  if (serverTimezone && d.tz && serverTimezone === d.tz) {
+    const sameZoneStatus = zoneCheck.kind === 'diff'
+      ? zoneCheck
+      : {text: 'Same timezone', kind: 'match'};
+    timezoneRows = [{label: 'Timezone', value: serverTimezone, status: sameZoneStatus}];
+    if (zoneCheck.kind === 'diff') {
+      timezoneRows.push({label: 'IP UTC offset', value: formatOffset(serverOffset)});
+      timezoneRows.push({label: 'Browser UTC offset', value: formatOffset(-d.tzOffsetMin * 60)});
     }
-    item.append(place);
-    geoList.append(item);
+  } else if (serverTimezone && d.tz) {
+    timezoneRows = [
+      {label: 'IP timezone', value: serverTimezone},
+      {label: 'Browser timezone', value: d.tz},
+      {label: 'Comparison', status: zoneCheck},
+    ];
+    if (typeof serverOffset === 'number') timezoneRows.push({label: 'IP UTC offset', value: formatOffset(serverOffset)});
+    if (typeof d.tzOffsetMin === 'number') timezoneRows.push({label: 'Browser UTC offset', value: formatOffset(-d.tzOffsetMin * 60)});
+  } else {
+    timezoneRows = [factRow('Timezone', serverTimezone, d.tz)].filter(Boolean);
   }
-  geoCard.append(geoList);
+  if (timezoneRows.length) addCard(grid, 'Timezone', timezoneRows, {icon: '/icons/timezone.svg'});
+
+  const clientLanguages = Array.isArray(d.languages) ? d.languages : String(d.languages || '').split(',');
+  const localeIsLanguage = d.locale && clientLanguages.some(language => String(language).toLowerCase() === d.locale.toLowerCase());
+  const languageRows = [
+    factRow('Languages', serverData.languages, d.languages),
+    d.locale && !localeIsLanguage ? {label: 'Locale', value: d.locale} : null,
+  ].filter(Boolean);
+  if (languageRows.length) addCard(grid, 'Language', languageRows, {icon: '/icons/language.svg'});
+
+  if (ipLookupError) {
+    const notice = document.createElement('div');
+    notice.className = 'notice';
+    notice.textContent = 'Some IP-based location details could not be loaded.';
+    entityContent.append(notice);
+  }
 }
 
-async function lookupWebRTCLocations(d) {
-  const ips = d.extra?.webrtc?.ips || [];
-  if (!ips.length) return {results: []};
-  const response = await fetch('/api/webrtc-geolocation', {
+async function submitVisit(clientData, ipResponses) {
+  const endpoint = new URL('/api/collect', doxScriptUrl);
+  const response = await fetch(endpoint, {
     method: 'POST',
     headers: {'content-type': 'application/json'},
-    body: JSON.stringify({serverIp: serverData.ip, ips}),
+    body: JSON.stringify({sessionId: bootData.sessionId, clientData, ipResponses}),
   });
-  if (!response.ok) throw new Error(`Geolocation request failed (${response.status})`);
+  if (!response.ok) throw new Error(`Collection request failed (${response.status})`);
   return response.json();
 }
 
 collect().then(async d => {
-  rawClient.textContent = JSON.stringify(d, null, 2);
-  rawIp.textContent = JSON.stringify({server: initialIpData.server, webrtc: []}, null, 2);
-  renderOverview(d);
+  if (!bootData.sessionId) throw new Error('Missing collection session');
+  if (rawClient) rawClient.textContent = JSON.stringify(d, null, 2);
+  if (entityContent) renderOverview(d);
   try {
-    const result = await lookupWebRTCLocations(d);
-    const locations = result.results || [];
-    rawIp.textContent = JSON.stringify({server: initialIpData.server, webrtc: locations}, null, 2);
-    renderOverview(d, locations);
+    const ipResponses = await lookupIpLocations(d);
+    const result = await submitVisit(d, ipResponses);
+    if (rawServer) rawServer.textContent = JSON.stringify(result.server, null, 2);
+    if (rawClient) rawClient.textContent = JSON.stringify(result.client, null, 2);
+    if (rawIp) rawIp.textContent = JSON.stringify(result.ip, null, 2);
+    if (entityContent) renderOverview(d, result.ip);
   } catch (error) {
-    const errorData = {error: String(error), results: []};
-    rawIp.textContent = JSON.stringify({server: initialIpData.server, webrtc: errorData}, null, 2);
-    renderOverview(d, [], error);
+    if (rawIp) rawIp.textContent = JSON.stringify({error: String(error), ...(bootData.ipResponse || {})}, null, 2);
+    if (entityContent) renderOverview(d, bootData.ipResponse || {server: null, peer: null, webrtc: []}, error);
+    console.error(error);
   }
 }).catch(error => {
-  rawClient.textContent = JSON.stringify({error: String(error)}, null, 2);
-  entityContent.replaceChildren();
-  const message = document.createElement('div');
-  message.className = 'loading';
-  message.textContent = 'Browser data could not be collected.';
-  entityContent.append(message);
+  if (rawClient) rawClient.textContent = JSON.stringify({error: String(error)}, null, 2);
+  if (entityContent) {
+    entityContent.replaceChildren();
+    const message = document.createElement('div');
+    message.className = 'loading';
+    message.textContent = 'Browser data could not be collected.';
+    entityContent.append(message);
+  }
   console.error(error);
 });
