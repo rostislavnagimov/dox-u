@@ -1,8 +1,5 @@
-# dox-u (Детектор цифрового отпечатка)
+# Project summary
 
-**Что это:** Интерактивный интерактивный сервис-демонстрация сетевой приватности.
+DOX-U is a self-hosted Rust analytics collector. A browser request for `/script.js` creates a SQLite visit record with server-observed data; the script then attaches browser-side data and geolocation lookup results. Sites can submit custom events through `window.doxU.track()` or `POST /api/events`, with each event joined to its visit record by a foreign key. The `/` overview and `/visits` dashboard provide the existing visual interface.
 
-**В чем фишка:**
-* **Полная прозрачность:** В реальном времени собирает и показывает пользователю абсолютно все данные, которые веб-сайт может узнать о нем без запроса каких-либо разрешений (IP, геолокация, canvas/WebGL-отпечатки, часовой пояс, список шрифтов).
-* **Обход VPN:** Экспериментально выявляет реальный IP-адрес пользователя за VPN/прокси через TURN-сервера WebRTC.
-* **Абсолютная конфиденциальность:** Данные нигде не сохраняются и не передаются третьим лицам — проект служит исключительно демонстрационным инструментом.
+See [README.md](README.md) for setup, integration, event tracking, configuration, and deployment details.

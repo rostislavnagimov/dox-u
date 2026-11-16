@@ -1,10 +1,42 @@
 const doxScriptUrl = document.currentScript?.src || location.href;
+const bootData = window.__DOX_BOOT__ || {};
+
+window.doxU = window.doxU && (typeof window.doxU === 'object' || typeof window.doxU === 'function')
+  ? window.doxU
+  : {};
+window.doxU.sessionId = bootData.sessionId;
+window.doxU.track = async function track(name, properties = {}) {
+  if (typeof name !== 'string') {
+    throw new TypeError('Event name must be a string');
+  }
+  const eventName = name.trim();
+  if (!eventName || [...eventName].length > 128) {
+    throw new TypeError('Event name must be a non-empty string of at most 128 characters');
+  }
+  if (properties === null || typeof properties !== 'object' || Array.isArray(properties)) {
+    throw new TypeError('Event properties must be an object');
+  }
+  if (!bootData.sessionId) throw new Error('Missing collection session');
+
+  const endpoint = new URL('./api/events', doxScriptUrl);
+  const body = JSON.stringify({sessionId: bootData.sessionId, name: eventName, properties});
+  if (new TextEncoder().encode(body).length > 64 * 1024) {
+    throw new RangeError('Event request exceeds the 64 KiB limit');
+  }
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body,
+    keepalive: true,
+  });
+  if (!response.ok) throw new Error(`Event request failed (${response.status})`);
+  return response.json();
+};
 
 async function collect() {
   const intl = Intl.DateTimeFormat().resolvedOptions();
   const c = navigator.connection;
 
-  // EVM wallets: EIP-6963 + legacy provider
   async function detectEvmWallets(timeout = 300) {
     const wallets = new Map();
 
@@ -16,7 +48,6 @@ async function collect() {
         name: info.name,
         rdns: info.rdns,
         uuid: info.uuid,
-        // icon: info.icon,
       });
     }
 
@@ -39,7 +70,6 @@ async function collect() {
     return [...wallets.values()];
   }
 
-  // Solana wallets
   function detectSolanaWallets() {
     const wallets = [];
 
@@ -57,9 +87,6 @@ async function collect() {
     return wallets;
   }
 
-  // WebRTC ICE candidates
-  // Collects only addresses exposed by the browser.
-  // Does not guarantee discovery of the public IP.
   async function getWebRTCIPs(timeout = 3000) {
     if (!window.RTCPeerConnection) return {
       supported: false,
@@ -68,11 +95,17 @@ async function collect() {
 
     return new Promise(resolve => {
       const ips = new Set();
-      const pc = new RTCPeerConnection({
+    let pc;
+    try {
+      pc = new RTCPeerConnection({
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' }
         ]
-      })
+      });
+    } catch {
+      resolve({supported: false, ips: []});
+      return;
+    }
       let finished = false;
 
       function finish() {
@@ -98,10 +131,9 @@ async function collect() {
 
 
         const candidate = event.candidate.candidate;
-        
+
         const parts = candidate.split(/\s+/);
 
-        // ICE candidate address is field 5 (zero-based index 4).
         const ip = parts[4];
 
         if (
@@ -128,7 +160,6 @@ async function collect() {
     });
   }
 
-  // GPU / WebGL
   function getGPU() {
     const canvas = document.createElement('canvas');
     const gl = canvas.getContext('webgl');
@@ -151,7 +182,6 @@ async function collect() {
     };
   }
 
-  // Storage
   async function getStorage() {
     if (!navigator.storage?.estimate) return null;
 
@@ -168,7 +198,6 @@ async function collect() {
     }
   }
 
-  // Media codecs
   async function getMediaCapabilities() {
     const formats = [
       'video/mp4; codecs="avc1.42E01E"',
@@ -189,7 +218,6 @@ async function collect() {
     return result;
   }
 
-  // Permission states (without requesting permissions)
   async function getPermissionStates() {
     if (!navigator.permissions) return {};
 
@@ -217,7 +245,6 @@ async function collect() {
     return result;
   }
 
-  // Media devices (without requesting access)
   async function getDeviceInfo() {
     if (!navigator.mediaDevices?.enumerateDevices) return null;
 
@@ -235,9 +262,13 @@ async function collect() {
     }
   }
 
-  // Original data
   const d = {
     time: new Date().toISOString(),
+    page: {
+      url: location.href,
+      title: document.title,
+      referrer: document.referrer,
+    },
     tz: intl.timeZone,
     tzOffsetMin: new Date().getTimezoneOffset(),
     locale: intl.locale,
@@ -278,7 +309,6 @@ async function collect() {
     },
   };
 
-  // Original User-Agent Client Hints
   if (navigator.userAgentData) {
     try {
       d.uaData = {
@@ -299,7 +329,6 @@ async function collect() {
     }
   }
 
-  // Additional capabilities
   const [
     evmWallets,
     storage,
@@ -391,7 +420,6 @@ const entityContent = document.getElementById('entity-content');
 const rawServer = document.getElementById('raw-server');
 const rawClient = document.getElementById('raw-client');
 const rawIp = document.getElementById('raw-ip');
-const bootData = window.__DOX_BOOT__ || {};
 const serverData = bootData.server || (rawServer ? JSON.parse(rawServer.textContent) : {});
 if (rawServer && bootData.server) rawServer.textContent = JSON.stringify(bootData.server, null, 2);
 if (rawIp && bootData.ipResponse) rawIp.textContent = JSON.stringify(bootData.ipResponse, null, 2);
@@ -787,11 +815,13 @@ function renderOverview(d, ipLookups = {server: null, peer: null, webrtc: []}, i
 }
 
 async function submitVisit(clientData, ipResponses) {
-  const endpoint = new URL('/api/collect', doxScriptUrl);
+  const endpoint = new URL('./api/collect', doxScriptUrl);
+  const payload = {sessionId: bootData.sessionId, ipResponses};
+  if (clientData !== null) payload.clientData = clientData;
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: {'content-type': 'application/json'},
-    body: JSON.stringify({sessionId: bootData.sessionId, clientData, ipResponses}),
+    body: JSON.stringify(payload),
   });
   if (!response.ok) throw new Error(`Collection request failed (${response.status})`);
   return response.json();
@@ -802,12 +832,23 @@ collect().then(async d => {
   if (rawClient) rawClient.textContent = JSON.stringify(d, null, 2);
   if (entityContent) renderOverview(d);
   try {
-    const ipResponses = await lookupIpLocations(d);
-    const result = await submitVisit(d, ipResponses);
-    if (rawServer) rawServer.textContent = JSON.stringify(result.server, null, 2);
-    if (rawClient) rawClient.textContent = JSON.stringify(result.client, null, 2);
-    if (rawIp) rawIp.textContent = JSON.stringify(result.ip, null, 2);
-    if (entityContent) renderOverview(d, result.ip);
+    const initial = await submitVisit(d, bootData.ipResponse || {});
+    if (rawServer) rawServer.textContent = JSON.stringify(initial.server, null, 2);
+    if (rawClient) rawClient.textContent = JSON.stringify(initial.client, null, 2);
+    if (rawIp) rawIp.textContent = JSON.stringify(initial.ip, null, 2);
+
+    try {
+      const ipResponses = await lookupIpLocations(d);
+      const result = await submitVisit(null, ipResponses);
+      if (rawServer) rawServer.textContent = JSON.stringify(result.server, null, 2);
+      if (rawClient) rawClient.textContent = JSON.stringify(result.client, null, 2);
+      if (rawIp) rawIp.textContent = JSON.stringify(result.ip, null, 2);
+      if (entityContent) renderOverview(d, result.ip);
+    } catch (error) {
+      if (rawIp) rawIp.textContent = JSON.stringify({error: String(error), ...(initial.ip || {})}, null, 2);
+      if (entityContent) renderOverview(d, initial.ip, error);
+      console.error(error);
+    }
   } catch (error) {
     if (rawIp) rawIp.textContent = JSON.stringify({error: String(error), ...(bootData.ipResponse || {})}, null, 2);
     if (entityContent) renderOverview(d, bootData.ipResponse || {server: null, peer: null, webrtc: []}, error);

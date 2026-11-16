@@ -37,6 +37,14 @@
       .raw-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-top: 10px; }
       .raw-card { min-width: 0; padding: 11px; border: 1px solid #e6ebf1; border-radius: 11px; background: #fbfcfe; }
       .raw-card h2 { margin: 0 0 8px; font-size: 11px; }
+      .event-list { display: grid; gap: 9px; margin-top: 10px; }
+      .event-item { min-width: 0; padding: 11px; border: 1px solid #e6ebf1; border-radius: 11px; background: #fbfcfe; }
+      .event-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; margin-bottom: 7px; }
+      .event-name { font-size: 11px; font-weight: 760; overflow-wrap: anywhere; }
+      .event-time { color: var(--muted); font-size: 10px; }
+      .pagination { display: flex; align-items: center; justify-content: center; gap: 16px; margin-top: 16px; color: var(--muted); font-size: 12px; }
+      .pagination a { color: var(--blue); font-weight: 700; text-decoration: none; }
+      .pagination a:hover { text-decoration: underline; }
       pre { max-height: 360px; margin: 0; overflow: auto; color: #34445c; font: 10px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
       .empty { margin-top: 18px; padding: 26px; border: 1px dashed #ced8e6; border-radius: 14px; color: var(--muted); text-align: center; }
       @media (max-width: 760px) { .raw-grid { grid-template-columns: 1fr; } }
@@ -56,6 +64,14 @@
         <p>Server, browser and IP data saved by this instance.</p>
         <span class="count">{{ total }} visits</span>
       </section>
+
+      {% if page_count > 1 %}
+      <nav class="pagination" aria-label="Visit pages">
+        {% if has_previous %}<a href="/visits?page={{ previous_page }}">Previous</a>{% endif %}
+        <span>Page {{ current_page }} of {{ page_count }}</span>
+        {% if has_next %}<a href="/visits?page={{ next_page }}">Next</a>{% endif %}
+      </nav>
+      {% endif %}
 
       {% if empty %}
       <div class="empty">No visits have been collected yet.</div>
@@ -88,12 +104,24 @@
           </div>
 
           <details>
-            <summary>Full stored data{% if visit.completed %} · completed {{ visit.completed_at }}{% endif %}</summary>
+            <summary>Full stored data · {{ visit.event_count }} events{% if visit.completed %} · completed {{ visit.completed_at }}{% endif %}</summary>
             <div class="raw-grid">
               <section class="raw-card"><h2>Server</h2><pre>{{ visit.server_json }}</pre></section>
               <section class="raw-card"><h2>Client</h2><pre>{{ visit.client_json }}</pre></section>
               <section class="raw-card"><h2>IP responses</h2><pre>{{ visit.ip_json }}</pre></section>
             </div>
+            {% if visit.event_count == 0 %}
+            <p class="event-time">No events reported for this visit.</p>
+            {% else %}
+            <div class="event-list">
+              {% for event in visit.events %}
+              <section class="event-item">
+                <div class="event-head"><span class="event-name">{{ event.name }}</span><time class="event-time">{{ event.created_at }}</time></div>
+                <pre>{{ event.properties_json }}</pre>
+              </section>
+              {% endfor %}
+            </div>
+            {% endif %}
           </details>
         </article>
         {% endfor %}

@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
@@ -7,12 +8,12 @@ use std::{
 use askama::Template;
 use axum::{
     Router,
-    extract::{ConnectInfo, Json, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Json, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde_json::{Value, json};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
@@ -21,6 +22,7 @@ use uuid::Uuid;
 struct AppState {
     db: Arc<Mutex<Connection>>,
     collector_mode: bool,
+    trusted_proxy_ips: HashSet<IpAddr>,
 }
 
 #[derive(Template)]
@@ -36,6 +38,12 @@ struct VisitsPage {
     visits: Vec<VisitView>,
     empty: bool,
     total: usize,
+    current_page: usize,
+    page_count: usize,
+    has_previous: bool,
+    previous_page: usize,
+    has_next: bool,
+    next_page: usize,
 }
 
 struct VisitView {
@@ -55,6 +63,8 @@ struct VisitView {
     server_json: String,
     client_json: String,
     ip_json: String,
+    events: Vec<EventView>,
+    event_count: usize,
 }
 
 struct VisitRecord {
@@ -65,21 +75,36 @@ struct VisitRecord {
     server_ip_response_json: String,
     client_data_json: Option<String>,
     webrtc_ip_responses_json: Option<String>,
+    events: Vec<EventRecord>,
 }
 
+struct EventRecord {
+    name: String,
+    created_at: String,
+    properties_json: String,
+}
+
+struct EventView {
+    name: String,
+    created_at: String,
+    properties_json: String,
+}
+
+const VISITS_PER_PAGE: usize = 50;
+
 fn open_database(path: &str) -> Result<Connection, Box<dyn std::error::Error>> {
-    if path != ":memory:" {
-        if let Some(parent) = Path::new(path)
+    if path != ":memory:"
+        && let Some(parent) = Path::new(path)
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)?;
-        }
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let db = Connection::open(path)?;
     db.execute_batch(
         "PRAGMA synchronous = NORMAL;
+         PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS visits (
              id TEXT PRIMARY KEY,
              created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -88,9 +113,34 @@ fn open_database(path: &str) -> Result<Connection, Box<dyn std::error::Error>> {
              server_ip_response_json TEXT NOT NULL,
              client_data_json TEXT,
              webrtc_ip_responses_json TEXT
-         );",
+         );
+         CREATE TABLE IF NOT EXISTS events (
+             id TEXT PRIMARY KEY,
+             visit_id TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
+             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+             name TEXT NOT NULL,
+             properties_json TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_visits_created_at
+             ON visits(created_at DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS idx_events_visit_created_at
+             ON events(visit_id, created_at);",
     )?;
     Ok(db)
+}
+
+fn trusted_proxy_ips_from_env() -> HashSet<IpAddr> {
+    std::env::var("TRUSTED_PROXY_IPS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse::<IpAddr>().unwrap_or_else(|error| {
+                panic!("Invalid IP in TRUSTED_PROXY_IPS ({value}): {error}");
+            })
+        })
+        .collect()
 }
 
 fn header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
@@ -158,6 +208,19 @@ fn visit_view(record: VisitRecord) -> VisitView {
         "webrtc": webrtc_ip_responses,
     });
 
+    let events = record
+        .events
+        .into_iter()
+        .map(|event| {
+            let properties = serde_json::from_str(&event.properties_json).unwrap_or(Value::Null);
+            EventView {
+                name: event.name,
+                created_at: event.created_at,
+                properties_json: pretty_json(&properties),
+            }
+        })
+        .collect::<Vec<_>>();
+
     VisitView {
         id: record.id,
         created_at: record.created_at,
@@ -193,20 +256,39 @@ fn visit_view(record: VisitRecord) -> VisitView {
             pretty_json(&client)
         },
         ip_json: pretty_json(&ip),
+        event_count: events.len(),
+        events,
     }
 }
 
-fn request_ip(headers: &HeaderMap, peer: SocketAddr) -> (IpAddr, &'static str) {
-    if let Some(ip) = header_value(headers, "x-forwarded-for")
-        .and_then(|value| value.split(',').next())
-        .and_then(|value| value.trim().parse::<IpAddr>().ok())
-    {
-        return (ip, "x-forwarded-for");
+fn request_ip(
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    trusted_proxy_ips: &HashSet<IpAddr>,
+) -> (IpAddr, &'static str) {
+    if !trusted_proxy_ips.contains(&peer.ip()) {
+        return (peer.ip(), "connection");
     }
-    if let Some(ip) = header_value(headers, "x-real-ip").and_then(|value| value.trim().parse().ok())
+
+    if let Some(value) = header_value(headers, "x-forwarded-for") {
+        for ip in value
+            .split(',')
+            .rev()
+            .filter_map(|value| value.trim().parse::<IpAddr>().ok())
+        {
+            if !trusted_proxy_ips.contains(&ip) {
+                return (ip, "x-forwarded-for");
+            }
+        }
+    }
+
+    if let Some(ip) = header_value(headers, "x-real-ip")
+        .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        .filter(|ip| !trusted_proxy_ips.contains(ip))
     {
         return (ip, "x-real-ip");
     }
+
     (peer.ip(), "connection")
 }
 
@@ -214,9 +296,13 @@ fn header_hint<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str
     header_value(headers, name).map(|value| value.trim_matches('"'))
 }
 
-fn parse_server_data(headers: &HeaderMap, peer: SocketAddr) -> Value {
+fn parse_server_data(
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    trusted_proxy_ips: &HashSet<IpAddr>,
+) -> Value {
     let ua = header_value(headers, "user-agent").unwrap_or("");
-    let (ip, ip_source) = request_ip(headers, peer);
+    let (ip, ip_source) = request_ip(headers, peer, trusted_proxy_ips);
 
     let platform = header_hint(headers, "sec-ch-ua-platform")
         .or_else(|| {
@@ -306,6 +392,9 @@ fn parse_server_data(headers: &HeaderMap, peer: SocketAddr) -> Value {
         "peerIp": peer.ip().to_string(),
         "ipMatchesPeer": ip == peer.ip(),
         "ipSource": ip_source,
+        "origin": header_value(headers, "origin"),
+        "referer": header_value(headers, "referer"),
+        "fetchSite": header_value(headers, "sec-fetch-site"),
     })
 }
 
@@ -319,48 +408,124 @@ fn server_headers_response(mut response: Response) -> Response {
     response
 }
 
-async fn index(State(state): State<AppState>) -> Response {
+async fn index(State(state): State<AppState>) -> Result<Response, StatusCode> {
     if state.collector_mode {
-        return server_headers_response(
+        return Ok(server_headers_response(
             Html("<!doctype html><html><head><meta charset=\"utf-8\"><title>Collector</title></head><body><script src=\"/script.js\" defer></script></body></html>")
                 .into_response(),
-        );
+        ));
     }
     let page = Page {
         server_data_json: "{}".into(),
         ip_response_json: "null".into(),
     };
-    server_headers_response(Html(page.render().unwrap_or_default()).into_response())
+    let html = page.render().map_err(|error| {
+        eprintln!("Could not render overview: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(server_headers_response(Html(html).into_response()))
 }
 
-async fn visits(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
+async fn visits(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Html<String>, StatusCode> {
+    let requested_page = query
+        .get("page")
+        .and_then(|page| page.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
     let db = state.db.clone();
-    let records = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<VisitRecord>> {
-        let db = db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let mut statement = db.prepare(
-            "SELECT id, created_at, completed_at, server_data_json, server_ip_response_json, client_data_json, webrtc_ip_responses_json FROM visits ORDER BY created_at DESC",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(VisitRecord {
-                id: row.get(0)?,
-                created_at: row.get(1)?,
-                completed_at: row.get(2)?,
-                server_data_json: row.get(3)?,
-                server_ip_response_json: row.get(4)?,
-                client_data_json: row.get(5)?,
-                webrtc_ip_responses_json: row.get(6)?,
-            })
-        })?;
-        rows.collect()
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (total, current_page, page_count, mut records, mut events_by_visit) =
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<_> {
+            let db = db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let total: usize = db.query_row("SELECT COUNT(*) FROM visits", [], |row| {
+                let count: i64 = row.get(0)?;
+                usize::try_from(count).map_err(|_| rusqlite::Error::InvalidQuery)
+            })?;
+            let page_count = total.div_ceil(VISITS_PER_PAGE);
+            let current_page = if page_count == 0 {
+                1
+            } else {
+                requested_page.min(page_count)
+            };
+            let offset = (current_page - 1) * VISITS_PER_PAGE;
+            let mut statement = db.prepare(
+                "SELECT id, created_at, completed_at, server_data_json, server_ip_response_json, client_data_json, webrtc_ip_responses_json FROM visits ORDER BY created_at DESC, id DESC LIMIT ?1 OFFSET ?2",
+            )?;
+            let rows = statement.query_map(
+                params![VISITS_PER_PAGE as i64, offset as i64],
+                |row| {
+                    Ok(VisitRecord {
+                        id: row.get(0)?,
+                        created_at: row.get(1)?,
+                        completed_at: row.get(2)?,
+                        server_data_json: row.get(3)?,
+                        server_ip_response_json: row.get(4)?,
+                        client_data_json: row.get(5)?,
+                        webrtc_ip_responses_json: row.get(6)?,
+                        events: Vec::new(),
+                    })
+                },
+            )?;
+            let records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+
+            let visit_ids = records
+                .iter()
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>();
+            let mut events_by_visit: HashMap<String, Vec<EventRecord>> = HashMap::new();
+            if !visit_ids.is_empty() {
+                let placeholders = (0..visit_ids.len())
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT visit_id, name, created_at, properties_json FROM events WHERE visit_id IN ({placeholders}) ORDER BY created_at ASC, id ASC"
+                );
+                let mut statement = db.prepare(&sql)?;
+                let rows = statement.query_map(params_from_iter(visit_ids.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        EventRecord {
+                            name: row.get(1)?,
+                            created_at: row.get(2)?,
+                            properties_json: row.get(3)?,
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (visit_id, event) = row?;
+                    events_by_visit.entry(visit_id).or_default().push(event);
+                }
+            }
+            Ok((
+                total,
+                current_page,
+                page_count,
+                records,
+                events_by_visit,
+            ))
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    for record in &mut records {
+        record.events = events_by_visit.remove(&record.id).unwrap_or_default();
+    }
 
     let views = records.into_iter().map(visit_view).collect::<Vec<_>>();
     let page = VisitsPage {
         empty: views.is_empty(),
-        total: views.len(),
+        total,
+        current_page,
+        page_count,
+        has_previous: current_page > 1,
+        previous_page: current_page.saturating_sub(1),
+        has_next: current_page < page_count,
+        next_page: current_page + 1,
         visits: views,
     };
     page.render()
@@ -373,7 +538,7 @@ async fn script(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let server = parse_server_data(&headers, peer);
+    let server = parse_server_data(&headers, peer, &state.trusted_proxy_ips);
     let ip_response = json!({ "server": null, "peer": null, "webrtc": [] });
 
     let visit_id = Uuid::new_v4().to_string();
@@ -415,7 +580,7 @@ async fn script(
         },
     });
     let script = format!(
-        "window.__DOX_BOOT__={};\n{}",
+        "(()=>{{const __doxPreviousBoot=window.__DOX_BOOT__;window.__DOX_BOOT__={};try{{\n{}\n}}finally{{if(__doxPreviousBoot===undefined)delete window.__DOX_BOOT__;else window.__DOX_BOOT__=__doxPreviousBoot;}}}})();",
         boot,
         include_str!("../static/script.js")
     );
@@ -445,31 +610,13 @@ async fn collect(
         .ok_or(StatusCode::BAD_REQUEST)?;
     let client_data = payload
         .get("clientData")
-        .cloned()
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .filter(|value| !value.is_null())
+        .cloned();
     let ip_results = payload
         .get("ipResponses")
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let db = state.db.clone();
-    let id_for_db = session_id.clone();
-    let stored = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<Value>> {
-        let db = db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let mut statement = db.prepare("SELECT server_data_json FROM visits WHERE id = ?1")?;
-        let mut rows = statement.query(params![id_for_db])?;
-        if let Some(row) = rows.next()? {
-            let server: String = row.get(0)?;
-            Ok(Some(serde_json::from_str(&server).unwrap_or(Value::Null)))
-        } else {
-            Ok(None)
-        }
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
-    let server_data = stored;
     let server_ip_response = ip_results.get("server").cloned().unwrap_or(Value::Null);
     let peer_ip_response = ip_results.get("peer").cloned().unwrap_or(Value::Null);
     let webrtc_ip_responses = ip_results
@@ -483,20 +630,26 @@ async fn collect(
     .to_string();
 
     let db = state.db.clone();
-    let id_for_db = session_id.clone();
-    let client_json = client_data.to_string();
+    let client_json = client_data.as_ref().map(Value::to_string);
     let webrtc_json = webrtc_ip_responses.to_string();
-    let updated = tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
-        db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?
-            .execute(
-                "UPDATE visits SET completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), client_data_json = ?2, server_ip_response_json = ?3, webrtc_ip_responses_json = ?4 WHERE id = ?1",
-                params![id_for_db, client_json, server_peer_json, webrtc_json],
-            )
-    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if updated == 0 {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    let (server_json, client_json) = tokio::task::spawn_blocking(move || {
+        let db = db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        db.query_row(
+            "UPDATE visits SET completed_at = CASE WHEN COALESCE(?2, client_data_json) IS NOT NULL THEN COALESCE(completed_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) ELSE completed_at END, client_data_json = COALESCE(?2, client_data_json), server_ip_response_json = ?3, webrtc_ip_responses_json = ?4 WHERE id = ?1 RETURNING server_data_json, client_data_json",
+            params![session_id, client_json, server_peer_json, webrtc_json],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let client_data = client_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or(Value::Null);
+    let server_data = serde_json::from_str(&server_json).unwrap_or(Value::Null);
 
     Ok(Json(json!({
         "server": server_data,
@@ -509,6 +662,73 @@ async fn collect(
     })))
 }
 
+async fn track_event(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    if payload.to_string().len() > 64 * 1024 {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let visit_id = payload
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .map(|value| value.to_string())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 128)
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .to_owned();
+    let properties = payload
+        .get("properties")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !properties.is_object() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let properties_json = properties.to_string();
+
+    let event_id = Uuid::new_v4().to_string();
+    let db = state.db.clone();
+    let stored = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<Value>> {
+        let mut db = db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let transaction = db.transaction()?;
+        let server_data: Option<String> = transaction
+            .query_row(
+                "SELECT server_data_json FROM visits WHERE id = ?1",
+                params![visit_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(server_data) = server_data else {
+            return Ok(None);
+        };
+        let created_at: String = transaction.query_row(
+            "INSERT INTO events (id, visit_id, name, properties_json) VALUES (?1, ?2, ?3, ?4) RETURNING created_at",
+            params![event_id, visit_id, name, properties_json],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(Some(json!({
+            "id": event_id,
+            "visitId": visit_id,
+            "name": name,
+            "createdAt": created_at,
+            "properties": properties,
+            "server": serde_json::from_str::<Value>(&server_data).unwrap_or(Value::Null),
+        })))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(stored))
+}
+
 #[tokio::main]
 async fn main() {
     let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "data/dox-u.sqlite3".into());
@@ -518,6 +738,7 @@ async fn main() {
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         collector_mode: std::env::var("DOX_MODE").is_ok_and(|value| value == "collector"),
+        trusted_proxy_ips: trusted_proxy_ips_from_env(),
     };
 
     let app = Router::new()
@@ -525,6 +746,10 @@ async fn main() {
         .route("/visits", get(visits))
         .route("/script.js", get(script))
         .route("/api/collect", post(collect))
+        .route(
+            "/api/events",
+            post(track_event).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".into());
